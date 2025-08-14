@@ -46,33 +46,36 @@ def _call_model(summary: str, language: str, model_name: str) -> Dict:
     resp = client.responses.create(
         model=model_name,
         input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": [{"type": "input_text", "text": user_text}]},
+            {"role": "system", "content": [{"type": "text", "text": system}]},
+            {"role": "user", 
+            "content": [{"type": "text", "text": user_text}]},
         ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "Structure",
-                "schema": schema,
-                "strict": True,   # 要求严格符合 schema
-            },
-        },
-        max_output_tokens=1200,   # 视需要调整
+        # response_format={
+        #     "type": "json_schema",
+        #     "json_schema": {
+        #         "name": "Structure",
+        #         "schema": schema,
+        #         "strict": True,   # 要求严格符合 schema
+        #     },
+        # },
+        # max_output_tokens=1200,   # 视需要调整
     )
-
+    txt = resp.choices[0].message.content.strip()
+    print(f"问题是：{user_text}")
+    print(f"通过模型得到的回复是：{txt}\n\n")
     # 首选 SDK 的聚合文本字段
-    txt = getattr(resp, "output_text", None)
-    if not txt:
-        # 兜底：从分片里提取首个文本块（个别模型/版本可能出现该情况）
-        out_items = getattr(resp, "output", []) or []
-        for item in out_items:
-            for c in getattr(item, "content", []) or []:
-                t = getattr(c, "text", None) or getattr(c, "string", None)
-                if isinstance(t, str) and t.strip():
-                    txt = t
-                    break
-            if txt:
-                break
+    # txt = getattr(resp, "output_text", None)
+    # if not txt:
+    #     # 兜底：从分片里提取首个文本块（个别模型/版本可能出现该情况）
+    #     out_items = getattr(resp, "output", []) or []
+    #     for item in out_items:
+    #         for c in getattr(item, "content", []) or []:
+    #             t = getattr(c, "text", None) or getattr(c, "string", None)
+    #             if isinstance(t, str) and t.strip():
+    #                 txt = t
+    #                 break
+    #         if txt:
+    #             break
 
     if not txt:
         raise RuntimeError("Empty model output")
@@ -82,6 +85,7 @@ def _call_model(summary: str, language: str, model_name: str) -> Dict:
 def process_single_item_openai(item: Dict, language: str, model_name: str) -> Dict:
     """处理单条数据：调用模型并把结构化结果写入 item['AI']。"""
     try:
+        
         item["AI"] = _call_model(item["summary"], language, model_name)
     except Exception as e:
         print(f"Item {item.get('id')} failed: {e}", file=sys.stderr)
@@ -96,7 +100,7 @@ def process_single_item_openai(item: Dict, language: str, model_name: str) -> Di
 
 def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int) -> List[Dict]:
     """并行处理所有数据项（线程池）。"""
-    print("Connect to:", model_name, file=sys.stderr)
+    print("连接到:", model_name, file=sys.stderr)
     processed_data = [None] * len(data)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
