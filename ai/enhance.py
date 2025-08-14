@@ -65,6 +65,28 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
         }
     return item
 
+def process_single_item2(model_name: str, system: str, template: str, item: Dict, language: str) -> Dict:
+    try:
+        llm = ChatOpenAI(model=model_name, temperature=0, timeout=60, max_retries=3)\
+              .with_structured_output(Structure, method="function_calling")
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(system),
+            HumanMessagePromptTemplate.from_template(template),
+        ])
+        chain = prompt | llm
+        resp: Structure = chain.invoke({"language": language, "content": item["summary"]})
+        item["AI"] = resp.model_dump()
+    except Exception as e:
+        # 最小化兜底：保留错误信息
+        item["AI"] = {
+            "tldr": "Error",
+            "motivation": f"Exception: {type(e).__name__}",
+            "method": "Error",
+            "result": "Error",
+            "conclusion": "Error",
+        }
+    return item
+
 def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int) -> List[Dict]:
     """并行处理所有数据项"""
     llm = ChatOpenAI(model=model_name).with_structured_output(Structure, method="function_calling")
