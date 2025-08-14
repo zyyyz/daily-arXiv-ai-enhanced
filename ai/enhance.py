@@ -1,86 +1,93 @@
 import os
 import json
 import sys
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict
-from queue import Queue
-from threading import Lock
 
 import dotenv
-import argparse
 from tqdm import tqdm
+from openai import OpenAI
 
-import langchain_core.exceptions
-from langchain_openai import ChatOpenAI
-from langchain.prompts import (
-    ChatPromptTemplate,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
-)
-from structure import Structure
+from structure import Structure  # 你已有的 Pydantic 模型
 
-if os.path.exists('.env'):
+# 读取 .env
+if os.path.exists(".env"):
     dotenv.load_dotenv()
-template = open("template.txt", "r").read()
-system = open("system.txt", "r").read()
+
+# 读取提示词
+template = open("template.txt", "r", encoding="utf-8").read()
+system = open("system.txt", "r", encoding="utf-8").read()
+
+# 初始化 OpenAI 客户端（支持自定义 BASE_URL 以兼容第三方 OpenAI-compatible 网关）
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL") or None,
+)
 
 def parse_args():
-    """解析命令行参数"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, required=True, help="jsonline data file")
     parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
     return parser.parse_args()
 
-def process_single_item(chain, item: Dict, language: str) -> Dict:
-    """处理单个数据项"""
+def _format_user_text(language: str, summary: str) -> str:
+    """把 language/summary 套进你的 template。若模板里含花括号导致 .format 报错，则退化为追加文本。"""
     try:
-        response: Structure = chain.invoke({
-            "language": language,
-            "content": item['summary']
-        })
-        item['AI'] = response.model_dump()
-    except langchain_core.exceptions.OutputParserException as e:
-        # 尝试从错误信息中提取 JSON 字符串并修复
-        error_msg = str(e)
-        if "Function Structure arguments:" in error_msg:
-            try:
-                # 提取 JSON 字符串
-                json_str = error_msg.split("Function Structure arguments:", 1)[1].strip().split('are not valid JSON')[0].strip()
-                # 预处理 LaTeX 数学符号 - 使用四个反斜杠来确保正确转义
-                json_str = json_str.replace('\\', '\\\\')
-                # 尝试解析修复后的 JSON
-                fixed_data = json.loads(json_str)
-                item['AI'] = fixed_data
-                return item
-            except Exception as json_e:
-                print(f"Failed to fix JSON for {item['id']}: {json_e} {json_str}", file=sys.stderr)
-        
-        # 如果修复失败，返回错误状态
-        item['AI'] = {
-            "tldr": "Error",
-            "motivation": "Error",
-            "method": "Error",
-            "result": "Error",
-            "conclusion": "Error"
-        }
-    return item
+        return template.format(language=language, content=summary)
+    except Exception:
+        return f"{template}\n\n[LANGUAGE]={language}\n[CONTENT]:\n{summary}"
 
-def process_single_item2(model_name: str, system: str, template: str, item: Dict, language: str) -> Dict:
+def _call_model(summary: str, language: str, model_name: str) -> Dict:
+    """调用 OpenAI Responses API，使用结构化输出（严格 JSON Schema）。"""
+    schema = Structure.model_json_schema()  # Pydantic v2
+    user_text = _format_user_text(language, summary)
+
+    resp = client.responses.create(
+        model=model_name,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": [{"type": "input_text", "text": user_text}]},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "Structure",
+                "schema": schema,
+                "strict": True,   # 要求严格符合 schema
+            },
+        },
+        max_output_tokens=1200,   # 视需要调整
+    )
+
+    # 首选 SDK 的聚合文本字段
+    txt = getattr(resp, "output_text", None)
+    if not txt:
+        # 兜底：从分片里提取首个文本块（个别模型/版本可能出现该情况）
+        out_items = getattr(resp, "output", []) or []
+        for item in out_items:
+            for c in getattr(item, "content", []) or []:
+                t = getattr(c, "text", None) or getattr(c, "string", None)
+                if isinstance(t, str) and t.strip():
+                    txt = t
+                    break
+            if txt:
+                break
+
+    if not txt:
+        raise RuntimeError("Empty model output")
+
+    return json.loads(txt)
+
+def process_single_item_openai(item: Dict, language: str, model_name: str) -> Dict:
+    """处理单条数据：调用模型并把结构化结果写入 item['AI']。"""
     try:
-        llm = ChatOpenAI(model=model_name, temperature=0, timeout=60, max_retries=3)\
-              .with_structured_output(Structure, method="function_calling")
-        prompt = ChatPromptTemplate.from_messages([
-            SystemMessagePromptTemplate.from_template(system),
-            HumanMessagePromptTemplate.from_template(template),
-        ])
-        chain = prompt | llm
-        resp: Structure = chain.invoke({"language": language, "content": item["summary"]})
-        item["AI"] = resp.model_dump()
+        item["AI"] = _call_model(item["summary"], language, model_name)
     except Exception as e:
-        # 最小化兜底：保留错误信息
+        print(f"Item {item.get('id')} failed: {e}", file=sys.stderr)
         item["AI"] = {
             "tldr": "Error",
-            "motivation": f"Exception: {type(e).__name__}",
+            "motivation": "Error",
             "method": "Error",
             "result": "Error",
             "conclusion": "Error",
@@ -88,83 +95,58 @@ def process_single_item2(model_name: str, system: str, template: str, item: Dict
     return item
 
 def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int) -> List[Dict]:
-    """并行处理所有数据项"""
-    llm = ChatOpenAI(model=model_name).with_structured_output(Structure, method="auto")
-    print('Connect to:', model_name, file=sys.stderr)
-    
-    prompt_template = ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(system),
-        HumanMessagePromptTemplate.from_template(template=template)
-    ])
+    """并行处理所有数据项（线程池）。"""
+    print("Connect to:", model_name, file=sys.stderr)
+    processed_data = [None] * len(data)
 
-    chain = prompt_template | llm
-    
-    # 使用线程池并行处理
-    processed_data = [None] * len(data)  # 预分配结果列表
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有任务
-        future_to_idx = {
-            executor.submit(process_single_item, chain, item, language): idx
+        fut2idx = {
+            executor.submit(process_single_item_openai, item, language, model_name): idx
             for idx, item in enumerate(data)
         }
-        
-        # 使用tqdm显示进度
-        for future in tqdm(
-            as_completed(future_to_idx),
-            total=len(data),
-            desc="Processing items"
-        ):
-            idx = future_to_idx[future]
+        for fut in tqdm(as_completed(fut2idx), total=len(data), desc="Processing items"):
+            idx = fut2idx[fut]
             try:
-                result = future.result()
-                processed_data[idx] = result
+                processed_data[idx] = fut.result()
             except Exception as e:
                 print(f"Item at index {idx} generated an exception: {e}", file=sys.stderr)
-                # 保持原始数据
                 processed_data[idx] = data[idx]
-    
     return processed_data
 
 def main():
     args = parse_args()
-    model_name = os.environ.get("MODEL_NAME", 'deepseek-chat')
-    language = os.environ.get("LANGUAGE", 'Chinese')
+    model_name = os.environ.get("MODEL_NAME", "gpt-4.1-mini")  # 换成你要用的模型
+    language = os.environ.get("LANGUAGE", "Chinese")
 
-    # 检查并删除目标文件
-    target_file = args.data.replace('.jsonl', f'_AI_enhanced_{language}.jsonl')
+    target_file = args.data.replace(".jsonl", f"_AI_enhanced_{language}.jsonl")
     if os.path.exists(target_file):
         os.remove(target_file)
-        print(f'Removed existing file: {target_file}', file=sys.stderr)
+        print(f"Removed existing file: {target_file}", file=sys.stderr)
 
-    # 读取数据
+    # 读取
     data = []
-    with open(args.data, "r") as f:
+    with open(args.data, "r", encoding="utf-8") as f:
         for line in f:
             data.append(json.loads(line))
 
-    # 去重
-    seen_ids = set()
-    unique_data = []
-    for item in data:
-        if item['id'] not in seen_ids:
-            seen_ids.add(item['id'])
-            unique_data.append(item)
+    # 去重（按 id）
+    seen = set()
+    uniq = []
+    for it in data:
+        if it["id"] not in seen:
+            seen.add(it["id"])
+            uniq.append(it)
+    data = uniq
 
-    data = unique_data
-    print('Open:', args.data, file=sys.stderr)
-    
-    # 并行处理所有数据
-    processed_data = process_all_items(
-        data,
-        model_name,
-        language,
-        args.max_workers
-    )
-    
-    # 保存结果
-    with open(target_file, "w") as f:
-        for item in processed_data:
-            f.write(json.dumps(item) + "\n")
+    print("Open:", args.data, file=sys.stderr)
+
+    # 并行处理
+    processed = process_all_items(data, model_name, language, args.max_workers)
+
+    # 保存（保留中文：ensure_ascii=False）
+    with open(target_file, "w", encoding="utf-8") as f:
+        for it in processed:
+            f.write(json.dumps(it, ensure_ascii=False) + "\n")
 
 if __name__ == "__main__":
     main()
