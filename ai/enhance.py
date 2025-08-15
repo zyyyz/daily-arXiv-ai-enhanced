@@ -65,7 +65,7 @@ def _call_model(summary: str, language: str, model_name: str) -> Dict:
         #     },
         # },
         # max_output_tokens=1200,   # 视需要调整
-    )
+    
     txt = resp.choices[0].message.content.strip()
     print(f"问题是：{user_text}")
     print(f"通过模型得到的回复是：{txt}\n\n")
