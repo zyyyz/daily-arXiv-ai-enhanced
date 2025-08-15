@@ -22,7 +22,7 @@ system = open("system.txt", "r", encoding="utf-8").read()
 # 初始化 OpenAI 客户端（支持自定义 BASE_URL 以兼容第三方 OpenAI-compatible 网关）
 client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("OPENAI_BASE_URL") or None,
+    base_url=os.getenv("OPENAI_BASE_URL"),
 )
 
 def parse_args():
@@ -42,14 +42,20 @@ def _call_model(summary: str, language: str, model_name: str) -> Dict:
     """调用 OpenAI Responses API，使用结构化输出（严格 JSON Schema）。"""
     schema = Structure.model_json_schema()  # Pydantic v2
     user_text = _format_user_text(language, summary)
-
-    resp = client.responses.create(
-        model=model_name,
-        input=[
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
             {"role": "system", "content": [{"type": "text", "text": system}]},
-            {"role": "user", 
-            "content": [{"type": "text", "text": user_text}]},
+            {"role": "user", "content": [{"type": "text", "text": user_text}]},
         ],
+    )
+    # resp = client.responses.create(
+    #     model=model_name,
+    #     input=[
+    #         {"role": "system", "content": [{"type": "text", "text": system}]},
+    #         {"role": "user", 
+    #         "content": [{"type": "text", "text": user_text}]},
+    #     ],
         # response_format={
         #     "type": "json_schema",
         #     "json_schema": {
